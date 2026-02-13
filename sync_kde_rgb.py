@@ -18,6 +18,7 @@ KDE_CONFIG_PATH = os.path.expanduser(
     "~/.config/plasma-org.kde.plasma.desktop-appletsrc"
 )
 POTD_CACHE_DIR = os.path.expanduser("~/.cache/plasma_engine_potd/")
+PORTAL_TOKEN_PATH = os.path.expanduser("~/.cache/sync_kde_rgb_portal_token")
 
 # VIA/QMK Constants for Rainy75
 ID_LIGHTING_SET_VALUE = 0x07
@@ -45,7 +46,23 @@ PROFILES = {
 _razer_devices_cache = None
 _razer_init_attempted = False
 _keyboard_devices_cache = None
+_keyboard_handle_cache = {}  # {device_path: hid.device()}
 _keyboard_mode_initialized = set()
+_debug = False
+
+# Pre-built HID command templates (33 bytes: report ID 0 + 32 payload)
+_CMD_EFFECT = bytes(
+    [0, ID_LIGHTING_SET_VALUE, CHANNEL_RGB_MATRIX, PROP_EFFECT, EFFECT_SOLID]
+    + [0] * 28
+)
+_CMD_BRIGHTNESS = bytes(
+    [0, ID_LIGHTING_SET_VALUE, CHANNEL_RGB_MATRIX, PROP_BRIGHTNESS, 255]
+    + [0] * 28
+)
+_CMD_COLOR_TEMPLATE = bytearray(
+    [0, ID_LIGHTING_SET_VALUE, CHANNEL_RGB_MATRIX, PROP_COLOR, 0, 0]
+    + [0] * 27
+)
 
 
 def get_kde_wallpaper():
@@ -268,15 +285,37 @@ def set_razer_color(rgb):
                         for c in range(cols):
                             device.fx.advanced.matrix[r, c] = rgb
                     device.fx.advanced.draw()
-                    print(f" - Set {device.name} matrix color to {rgb}")
+                    if _debug:
+                        print(f" - Set {device.name} matrix color to {rgb}")
                 else:
                     if hasattr(device.fx, "static"):
                         device.fx.static(*rgb)
-                    print(f" - Set {device.name} static color to {rgb}")
+                    if _debug:
+                        print(f" - Set {device.name} static color to {rgb}")
             except Exception as e:
                 print(f" - Failed to set {device.name}: {e}", file=sys.stderr)
     except Exception as e:
         print(f"Razer init failed: {e}")
+
+
+def _get_keyboard_handle(device_path):
+    """Get or create a cached HID handle for a keyboard device."""
+    if device_path in _keyboard_handle_cache:
+        return _keyboard_handle_cache[device_path]
+    h_dev = hid.device()
+    h_dev.open_path(device_path)
+    _keyboard_handle_cache[device_path] = h_dev
+    return h_dev
+
+
+def _close_keyboard_handles():
+    """Close all cached HID handles."""
+    for path, h_dev in _keyboard_handle_cache.items():
+        try:
+            h_dev.close()
+        except Exception:
+            pass
+    _keyboard_handle_cache.clear()
 
 
 def set_keyboard_color(rgb):
@@ -303,51 +342,33 @@ def set_keyboard_color(rgb):
             ]
 
         if not _keyboard_devices_cache:
-            print("No Rainy 75 keyboard found.")
+            if _debug:
+                print("No Rainy 75 keyboard found.")
             return
 
         for device_path, product_name in _keyboard_devices_cache:
             try:
-                h_dev = hid.device()
-                h_dev.open_path(device_path)
+                h_dev = _get_keyboard_handle(device_path)
 
                 if device_path not in _keyboard_mode_initialized:
-                    cmd_effect = [
-                        ID_LIGHTING_SET_VALUE,
-                        CHANNEL_RGB_MATRIX,
-                        PROP_EFFECT,
-                        EFFECT_SOLID,
-                    ]
-                    cmd_effect += [0] * (32 - len(cmd_effect))
-                    h_dev.write([0] + cmd_effect)
+                    h_dev.write(_CMD_EFFECT)
                     time.sleep(0.05)
-
-                    cmd_bright = [
-                        ID_LIGHTING_SET_VALUE,
-                        CHANNEL_RGB_MATRIX,
-                        PROP_BRIGHTNESS,
-                        255,
-                    ]
-                    cmd_bright += [0] * (32 - len(cmd_bright))
-                    h_dev.write([0] + cmd_bright)
+                    h_dev.write(_CMD_BRIGHTNESS)
                     time.sleep(0.05)
                     _keyboard_mode_initialized.add(device_path)
 
-                cmd_color = [
-                    ID_LIGHTING_SET_VALUE,
-                    CHANNEL_RGB_MATRIX,
-                    PROP_COLOR,
-                    qmk_hue,
-                    qmk_sat,
-                ]
-                cmd_color += [0] * (32 - len(cmd_color))
-                h_dev.write([0] + cmd_color)
-                print(
-                    f" - Set Rainy75 ({product_name}) to Hue={qmk_hue}, Sat={qmk_sat}"
-                )
-                h_dev.close()
+                cmd = bytearray(_CMD_COLOR_TEMPLATE)
+                cmd[4] = qmk_hue
+                cmd[5] = qmk_sat
+                h_dev.write(cmd)
+                if _debug:
+                    print(
+                        f" - Set Rainy75 ({product_name}) to Hue={qmk_hue}, Sat={qmk_sat}"
+                    )
             except Exception as ex:
                 print(f" - Error writing to keyboard: {ex}", file=sys.stderr)
+                # Handle might be stale — remove from cache and retry next time
+                _keyboard_handle_cache.pop(device_path, None)
 
     except Exception as e:
         print(f"Error enumerating HID devices: {e}", file=sys.stderr)
@@ -462,6 +483,7 @@ class PortalScreenCapture:
                     "types": GLib.Variant("u", 1),
                     "multiple": GLib.Variant("b", True),
                     "cursor_mode": GLib.Variant("u", 2),
+                    "persist_mode": GLib.Variant("u", 2),
                 },
             ),
         )
@@ -470,18 +492,42 @@ class PortalScreenCapture:
         ).unpack()[0]
         wait_for_response(request_path)
 
+        # Load saved restore token to skip portal dialog on restart
+        restore_token = ""
+        try:
+            if os.path.exists(PORTAL_TOKEN_PATH):
+                with open(PORTAL_TOKEN_PATH) as f:
+                    restore_token = f.read().strip()
+        except Exception:
+            pass
+
         start_params = GLib.Variant(
             "(osa{sv})",
             (
                 self.session_handle,
                 "",
-                {"handle_token": GLib.Variant("s", f"{token}_start")},
+                {
+                    "handle_token": GLib.Variant("s", f"{token}_start"),
+                    **({
+                        "restore_token": GLib.Variant("s", restore_token),
+                    } if restore_token else {}),
+                },
             ),
         )
         request_path = portal.call_sync(
             "Start", start_params, Gio.DBusCallFlags.NONE, -1, None
         ).unpack()[0]
         start_results = wait_for_response(request_path)
+
+        # Save restore token for future restarts
+        new_token = start_results.get("restore_token", "")
+        if new_token:
+            try:
+                with open(PORTAL_TOKEN_PATH, "w") as f:
+                    f.write(new_token)
+            except Exception:
+                pass
+
         streams = start_results.get("streams") or []
         if not streams:
             raise RuntimeError("Portal did not provide any streams.")
@@ -539,17 +585,22 @@ class PortalScreenCapture:
 
         use_target = os.environ.get("SYNC_KDE_RGB_PIPEWIRE_TARGET") == "1"
         source = "target-object" if use_target else "path"
+        # Pipeline design:
+        # 1. pipewiresrc captures at screen refresh rate
+        # 2. videorate drop-only drops to target fps BEFORE any processing
+        # 3. videoconvert + videoscale only process ~1 frame/sec
+        # 4. Scale to 1x1 in native C code = average color (no PIL needed)
         pipeline_desc = (
             "pipewiresrc fd={fd} {source}={path} do-timestamp=true ! "
+            "videorate drop-only=true ! video/x-raw,framerate={fps}/1 ! "
             "queue leaky=downstream max-size-buffers=1 ! "
-            "videoconvert ! videoscale ! "
-            "video/x-raw,format=RGB,width={width},height={height} "
+            "videoconvert ! videoscale method=bilinear ! "
+            "video/x-raw,format=RGB,width=1,height=1 "
             "! appsink name=sink max-buffers=1 drop=true sync=false"
         ).format(
             fd=self.fd,
             path=node_id,
-            width=self.width,
-            height=self.height,
+            fps=max(self.fps, 1),
             source=source,
         )
 
@@ -572,6 +623,7 @@ class PortalScreenCapture:
             raise RuntimeError("GStreamer pipeline failed to reach PLAYING.")
 
     def read_frame(self):
+        """Read a 1x1 frame and return the average color as an (R, G, B) tuple."""
         if not self.sink:
             return None
 
@@ -597,8 +649,9 @@ class PortalScreenCapture:
             return None
 
         try:
+            # 1x1 RGB frame = exactly 3 bytes
             data = map_info.data
-            return Image.frombytes("RGB", (self.width, self.height), data)
+            return (data[0], data[1], data[2])
         finally:
             buffer.unmap(map_info)
 
@@ -624,19 +677,22 @@ async def run_screen_sync(args):
     )
     await capture.start()
 
-    interval = 1.0 / max(args.fps, 1)
+    base_interval = 1.0 / max(args.fps, 1)
+    interval = base_interval
+    max_interval = base_interval * 10  # Back off up to 10x when idle
+    stable_count = 0
+    stable_threshold = 10  # Frames without change before backing off
     previous = None
     last_sent = None
     frame_count = 0
     loop_count = 0
     capture_time_total = 0.0
-    color_time_total = 0.0
     io_time_total = 0.0
     send_count = 0
 
     print("--- KDE Screen RGB Sync ---")
     print(f"Profile: {args.profile}")
-    print(f"Capture {width}x{height} at {args.fps} fps")
+    print(f"Capture {width}x{height} (pipeline 1x1) at {args.fps} fps")
     if capture.streams and args.list_streams:
         print("Available streams:")
         for idx, stream in enumerate(capture.streams):
@@ -674,50 +730,48 @@ async def run_screen_sync(args):
             loop_count += 1
 
             capture_start = time.monotonic()
-            frame = capture.read_frame()
+            color = capture.read_frame()
             capture_time_total += time.monotonic() - capture_start
 
-            if frame is not None:
+            if color is not None:
                 frame_count += 1
-                color_start = time.monotonic()
-                color = dominant_color_from_image(
-                    frame,
-                    colors=args.colors,
-                    min_brightness=args.min_brightness,
-                )
-                color_time_total += time.monotonic() - color_start
-                if color:
-                    smoothed = smooth_color(previous, color, args.alpha)
-                    previous = smoothed
+                smoothed = smooth_color(previous, color, args.alpha)
+                previous = smoothed
 
-                    should_send = args.force_update
-                    if (
-                        last_sent is None
-                        or color_distance(last_sent, smoothed) >= args.min_delta
-                    ):
-                        should_send = True
+                should_send = args.force_update
+                if (
+                    last_sent is None
+                    or color_distance(last_sent, smoothed) >= args.min_delta
+                ):
+                    should_send = True
 
-                    if should_send:
-                        io_start = time.monotonic()
-                        set_razer_color(smoothed)
-                        set_keyboard_color(smoothed)
-                        io_time_total += time.monotonic() - io_start
-                        send_count += 1
-                        last_sent = smoothed
-                    if args.debug and loop_count % args.debug_interval == 0:
-                        print(f"Color RGB{smoothed} (raw {color})")
-                        print(
-                            "Timing avg(ms): "
-                            f"capture={capture_time_total * 1000 / max(loop_count, 1):.2f}, "
-                            f"color={color_time_total * 1000 / max(frame_count, 1):.2f}, "
-                            f"io={io_time_total * 1000 / max(send_count, 1):.2f}"
-                        )
-                elif args.debug and loop_count % args.debug_interval == 0:
-                    print("No dominant color computed.")
+                if should_send:
+                    io_start = time.monotonic()
+                    set_razer_color(smoothed)
+                    set_keyboard_color(smoothed)
+                    io_time_total += time.monotonic() - io_start
+                    send_count += 1
+                    last_sent = smoothed
+                    # Reset adaptive rate on change
+                    stable_count = 0
+                    interval = base_interval
+                else:
+                    # No change — back off polling rate
+                    stable_count += 1
+                    if stable_count >= stable_threshold:
+                        interval = min(interval * 1.5, max_interval)
+
+                if args.debug and loop_count % args.debug_interval == 0:
+                    print(f"Color RGB{smoothed} (raw {color}) interval={interval:.2f}s")
+                    print(
+                        "Timing avg(ms): "
+                        f"capture={capture_time_total * 1000 / max(loop_count, 1):.2f}, "
+                        f"io={io_time_total * 1000 / max(send_count, 1):.2f}"
+                    )
             elif args.debug and loop_count % args.debug_interval == 0:
                 if capture.last_bus_error:
                     print(
-                        f"No frame received from capture. Bus error: {capture.last_bus_error}"
+                        f"No frame received. Bus error: {capture.last_bus_error}"
                     )
                 else:
                     print("No frame received from capture.")
@@ -728,6 +782,7 @@ async def run_screen_sync(args):
                 await asyncio.sleep(sleep_time)
     finally:
         capture.stop()
+        _close_keyboard_handles()
 
 
 def parse_scale(value):
@@ -813,6 +868,9 @@ def main():
     if args.instant:
         args.alpha = 1.0
         args.min_delta = 0
+
+    global _debug
+    _debug = args.debug
 
     if args.mode == "screen":
         try:
