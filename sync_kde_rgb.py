@@ -31,9 +31,21 @@ DEFAULT_FPS = 1
 DEFAULT_SCALE = "160x90"
 DEFAULT_COLORS = 5
 DEFAULT_ALPHA = 1.0
-DEFAULT_MIN_DELTA = 0
+DEFAULT_MIN_DELTA = 8
 DEFAULT_MIN_BRIGHTNESS = 30
 DEFAULT_DEBUG_INTERVAL = 60
+DEFAULT_PROFILE = "balanced"
+
+PROFILES = {
+    "performance": {"fps": 1, "scale": (128, 72), "colors": 3},
+    "balanced": {"fps": 1, "scale": (160, 90), "colors": 5},
+    "quality": {"fps": 2, "scale": (256, 144), "colors": 8},
+}
+
+_razer_devices_cache = None
+_razer_init_attempted = False
+_keyboard_devices_cache = None
+_keyboard_mode_initialized = set()
 
 
 def get_kde_wallpaper():
@@ -233,13 +245,19 @@ def dominant_color_from_image(
 
 
 def set_razer_color(rgb):
+    global _razer_devices_cache, _razer_init_attempted
     try:
-        device_manager = DeviceManager()
-        if len(device_manager.devices) == 0:
-            time.sleep(1)
+        if not _razer_init_attempted:
+            device_manager = DeviceManager()
+            if len(device_manager.devices) == 0:
+                time.sleep(1)
+            _razer_devices_cache = device_manager.devices
+            _razer_init_attempted = True
+            print(f"Found {len(_razer_devices_cache)} Razer devices.")
 
-        devices = device_manager.devices
-        print(f"Found {len(devices)} Razer devices.")
+        devices = _razer_devices_cache or []
+        if not devices:
+            return
 
         for device in devices:
             try:
@@ -262,6 +280,7 @@ def set_razer_color(rgb):
 
 
 def set_keyboard_color(rgb):
+    global _keyboard_devices_cache
     r, g, b = [x / 255.0 for x in rgb]
     h, s, v = colorsys.rgb_to_hsv(r, g, b)
     qmk_hue = int(h * 255)
@@ -271,19 +290,28 @@ def set_keyboard_color(rgb):
     usage_page = 0xFF60
     usage = 0x61
 
-    found_any = False
-
     try:
-        for d_info in hid.enumerate():
-            if (
-                d_info["vendor_id"] == target_vid
-                and d_info["usage_page"] == usage_page
-                and d_info["usage"] == usage
-            ):
-                try:
-                    h_dev = hid.device()
-                    h_dev.open_path(d_info["path"])
+        if _keyboard_devices_cache is None:
+            _keyboard_devices_cache = [
+                (d_info["path"], d_info.get("product_string", "Unknown"))
+                for d_info in hid.enumerate()
+                if (
+                    d_info["vendor_id"] == target_vid
+                    and d_info["usage_page"] == usage_page
+                    and d_info["usage"] == usage
+                )
+            ]
 
+        if not _keyboard_devices_cache:
+            print("No Rainy 75 keyboard found.")
+            return
+
+        for device_path, product_name in _keyboard_devices_cache:
+            try:
+                h_dev = hid.device()
+                h_dev.open_path(device_path)
+
+                if device_path not in _keyboard_mode_initialized:
                     cmd_effect = [
                         ID_LIGHTING_SET_VALUE,
                         CHANNEL_RGB_MATRIX,
@@ -294,7 +322,6 @@ def set_keyboard_color(rgb):
                     h_dev.write([0] + cmd_effect)
                     time.sleep(0.05)
 
-                    # Ensure Max Brightness
                     cmd_bright = [
                         ID_LIGHTING_SET_VALUE,
                         CHANNEL_RGB_MATRIX,
@@ -304,27 +331,23 @@ def set_keyboard_color(rgb):
                     cmd_bright += [0] * (32 - len(cmd_bright))
                     h_dev.write([0] + cmd_bright)
                     time.sleep(0.05)
+                    _keyboard_mode_initialized.add(device_path)
 
-                    cmd_color = [
-                        ID_LIGHTING_SET_VALUE,
-                        CHANNEL_RGB_MATRIX,
-                        PROP_COLOR,
-                        qmk_hue,
-                        qmk_sat,
-                    ]
-                    cmd_color += [0] * (32 - len(cmd_color))
-                    h_dev.write([0] + cmd_color)
-
-                    print(
-                        f" - Set Rainy75 ({d_info.get('product_string', 'Unknown')}) to Hue={qmk_hue}, Sat={qmk_sat}"
-                    )
-                    h_dev.close()
-                    found_any = True
-                except Exception as ex:
-                    print(f" - Error writing to keyboard: {ex}", file=sys.stderr)
-
-        if not found_any:
-            print("No Rainy 75 keyboard found.")
+                cmd_color = [
+                    ID_LIGHTING_SET_VALUE,
+                    CHANNEL_RGB_MATRIX,
+                    PROP_COLOR,
+                    qmk_hue,
+                    qmk_sat,
+                ]
+                cmd_color += [0] * (32 - len(cmd_color))
+                h_dev.write([0] + cmd_color)
+                print(
+                    f" - Set Rainy75 ({product_name}) to Hue={qmk_hue}, Sat={qmk_sat}"
+                )
+                h_dev.close()
+            except Exception as ex:
+                print(f" - Error writing to keyboard: {ex}", file=sys.stderr)
 
     except Exception as e:
         print(f"Error enumerating HID devices: {e}", file=sys.stderr)
@@ -606,8 +629,13 @@ async def run_screen_sync(args):
     last_sent = None
     frame_count = 0
     loop_count = 0
+    capture_time_total = 0.0
+    color_time_total = 0.0
+    io_time_total = 0.0
+    send_count = 0
 
     print("--- KDE Screen RGB Sync ---")
+    print(f"Profile: {args.profile}")
     print(f"Capture {width}x{height} at {args.fps} fps")
     if capture.streams and args.list_streams:
         print("Available streams:")
@@ -644,14 +672,20 @@ async def run_screen_sync(args):
         while True:
             start = time.monotonic()
             loop_count += 1
+
+            capture_start = time.monotonic()
             frame = capture.read_frame()
+            capture_time_total += time.monotonic() - capture_start
+
             if frame is not None:
                 frame_count += 1
+                color_start = time.monotonic()
                 color = dominant_color_from_image(
                     frame,
                     colors=args.colors,
                     min_brightness=args.min_brightness,
                 )
+                color_time_total += time.monotonic() - color_start
                 if color:
                     smoothed = smooth_color(previous, color, args.alpha)
                     previous = smoothed
@@ -664,11 +698,20 @@ async def run_screen_sync(args):
                         should_send = True
 
                     if should_send:
+                        io_start = time.monotonic()
                         set_razer_color(smoothed)
                         set_keyboard_color(smoothed)
+                        io_time_total += time.monotonic() - io_start
+                        send_count += 1
                         last_sent = smoothed
                     if args.debug and loop_count % args.debug_interval == 0:
                         print(f"Color RGB{smoothed} (raw {color})")
+                        print(
+                            "Timing avg(ms): "
+                            f"capture={capture_time_total * 1000 / max(loop_count, 1):.2f}, "
+                            f"color={color_time_total * 1000 / max(frame_count, 1):.2f}, "
+                            f"io={io_time_total * 1000 / max(send_count, 1):.2f}"
+                        )
                 elif args.debug and loop_count % args.debug_interval == 0:
                     print("No dominant color computed.")
             elif args.debug and loop_count % args.debug_interval == 0:
@@ -704,6 +747,7 @@ def parse_scale(value):
 
 
 def main():
+    argv = sys.argv[1:]
     parser = argparse.ArgumentParser(description="Sync RGB to KDE screen or wallpaper.")
     parser.add_argument(
         "--mode",
@@ -711,9 +755,15 @@ def main():
         default="screen",
         help="Sync to live screen or static wallpaper",
     )
-    parser.add_argument("--fps", type=int, default=DEFAULT_FPS)
-    parser.add_argument("--scale", type=parse_scale, default=parse_scale(DEFAULT_SCALE))
-    parser.add_argument("--colors", type=int, default=DEFAULT_COLORS)
+    parser.add_argument(
+        "--profile",
+        choices=list(PROFILES.keys()),
+        default=DEFAULT_PROFILE,
+        help="Performance profile for capture/color processing",
+    )
+    parser.add_argument("--fps", type=int, default=None)
+    parser.add_argument("--scale", type=parse_scale, default=None)
+    parser.add_argument("--colors", type=int, default=None)
     parser.add_argument("--alpha", type=float, default=DEFAULT_ALPHA)
     parser.add_argument("--min-delta", type=int, default=DEFAULT_MIN_DELTA)
     parser.add_argument("--min-brightness", type=int, default=DEFAULT_MIN_BRIGHTNESS)
@@ -750,7 +800,15 @@ def main():
         action="store_true",
         help="List available portal streams and exit",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+
+    profile_defaults = PROFILES[args.profile]
+    if args.fps is None:
+        args.fps = profile_defaults["fps"]
+    if args.scale is None:
+        args.scale = profile_defaults["scale"]
+    if args.colors is None:
+        args.colors = profile_defaults["colors"]
 
     if args.instant:
         args.alpha = 1.0
