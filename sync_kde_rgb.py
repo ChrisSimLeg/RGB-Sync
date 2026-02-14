@@ -417,15 +417,44 @@ class PortalScreenCapture:
 
         Gst.init(None)
 
-        portal = Gio.DBusProxy.new_for_bus_sync(
-            Gio.BusType.SESSION,
-            Gio.DBusProxyFlags.NONE,
-            None,
-            "org.freedesktop.portal.Desktop",
-            "/org/freedesktop/portal/desktop",
-            "org.freedesktop.portal.ScreenCast",
-            None,
-        )
+        # Retry portal connection — it may not be ready immediately after boot
+        portal = None
+        for attempt in range(30):
+            try:
+                proxy = Gio.DBusProxy.new_for_bus_sync(
+                    Gio.BusType.SESSION,
+                    Gio.DBusProxyFlags.NONE,
+                    None,
+                    "org.freedesktop.portal.Desktop",
+                    "/org/freedesktop/portal/desktop",
+                    "org.freedesktop.portal.ScreenCast",
+                    None,
+                )
+                # Verify the interface is actually available
+                proxy.call_sync(
+                    "org.freedesktop.DBus.Properties.Get",
+                    GLib.Variant("(ss)", (
+                        "org.freedesktop.portal.ScreenCast", "version"
+                    )),
+                    Gio.DBusCallFlags.NONE,
+                    1000,
+                    None,
+                )
+                portal = proxy
+                break
+            except Exception:
+                if attempt < 29:
+                    print(
+                        f"Portal not ready (attempt {attempt + 1}/30), "
+                        "retrying in 2s...",
+                        file=sys.stderr,
+                    )
+                    await asyncio.sleep(2)
+                else:
+                    raise RuntimeError(
+                        "xdg-desktop-portal ScreenCast interface not available "
+                        "after 60s. Is xdg-desktop-portal running?"
+                    )
         self.portal_proxy = portal
 
         def wait_for_response(request_path):

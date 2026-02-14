@@ -1,0 +1,17 @@
+[Unit]
+Description=Sync KDE Screen Color to RGB Devices (Razer & VIA)
+After=graphical-session.target plasma-xdg-desktop-portal-kde.service xdg-desktop-portal.service
+Wants=plasma-xdg-desktop-portal-kde.service
+
+[Service]
+Type=simple
+ExecStartPre=/bin/sleep 3
+ExecStart=/home/chris/.local/bin/sync_kde_rgb.py --mode screen --profile balanced
+Restart=on-failure
+RestartSec=5
+RestartMaxDelaySec=60
+IOSchedulingClass=idle
+CPUSchedulingPolicy=idle
+
+[Install]
+WantedBy=default.target
