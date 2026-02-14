@@ -417,8 +417,12 @@ class PortalScreenCapture:
 
         Gst.init(None)
 
-        # Retry portal connection — it may not be ready immediately after boot
+        # Retry portal connection — it may not be ready immediately after boot.
+        # Common race: xdg-desktop-portal starts before plasma-xdg-desktop-portal-kde,
+        # so ScreenCast interface isn't registered. We detect this and restart the
+        # main portal once to force it to re-discover backends.
         portal = None
+        portal_restarted = False
         for attempt in range(30):
             try:
                 proxy = Gio.DBusProxy.new_for_bus_sync(
@@ -443,6 +447,30 @@ class PortalScreenCapture:
                 portal = proxy
                 break
             except Exception:
+                if not portal_restarted and attempt >= 3:
+                    # The main portal likely started before the KDE backend.
+                    # Restart it so it discovers the ScreenCast interface.
+                    print(
+                        "ScreenCast not available — restarting xdg-desktop-portal "
+                        "to discover KDE backend...",
+                        file=sys.stderr,
+                    )
+                    try:
+                        import subprocess
+                        subprocess.run(
+                            ["systemctl", "--user", "restart",
+                             "xdg-desktop-portal.service"],
+                            timeout=10,
+                        )
+                    except Exception as restart_err:
+                        print(
+                            f"Failed to restart portal: {restart_err}",
+                            file=sys.stderr,
+                        )
+                    portal_restarted = True
+                    await asyncio.sleep(3)
+                    continue
+
                 if attempt < 29:
                     print(
                         f"Portal not ready (attempt {attempt + 1}/30), "

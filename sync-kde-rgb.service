@@ -9,7 +9,6 @@ ExecStartPre=/bin/sleep 3
 ExecStart=/home/chris/.local/bin/sync_kde_rgb.py --mode screen --profile balanced
 Restart=on-failure
 RestartSec=5
-RestartMaxDelaySec=60
 IOSchedulingClass=idle
 CPUSchedulingPolicy=idle
 
