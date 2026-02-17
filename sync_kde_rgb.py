@@ -532,6 +532,15 @@ class PortalScreenCapture:
         if not self.session_handle:
             raise RuntimeError("Portal did not return a session handle.")
 
+        # Load saved restore token to skip portal dialog on restart
+        restore_token = ""
+        try:
+            if os.path.exists(PORTAL_TOKEN_PATH):
+                with open(PORTAL_TOKEN_PATH) as f:
+                    restore_token = f.read().strip()
+        except Exception:
+            pass
+
         select_params = GLib.Variant(
             "(oa{sv})",
             (
@@ -541,6 +550,9 @@ class PortalScreenCapture:
                     "multiple": GLib.Variant("b", True),
                     "cursor_mode": GLib.Variant("u", 2),
                     "persist_mode": GLib.Variant("u", 2),
+                    **({
+                        "restore_token": GLib.Variant("s", restore_token),
+                    } if restore_token else {}),
                 },
             ),
         )
@@ -548,15 +560,6 @@ class PortalScreenCapture:
             "SelectSources", select_params, Gio.DBusCallFlags.NONE, -1, None
         ).unpack()[0]
         wait_for_response(request_path)
-
-        # Load saved restore token to skip portal dialog on restart
-        restore_token = ""
-        try:
-            if os.path.exists(PORTAL_TOKEN_PATH):
-                with open(PORTAL_TOKEN_PATH) as f:
-                    restore_token = f.read().strip()
-        except Exception:
-            pass
 
         start_params = GLib.Variant(
             "(osa{sv})",
